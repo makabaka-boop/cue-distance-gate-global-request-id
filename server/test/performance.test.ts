@@ -519,6 +519,375 @@ describe('performance console — same-version concurrency', () => {
   });
 });
 
+/**
+ * An N-party synchronous barrier: every party blocks until all N have
+ * arrived, then they are released together (onto separate microtasks), so
+ * the racing requests are interleaved deliberately rather than by luck.
+ */
+function barrier(count: number) {
+  let release!: () => void;
+  const open = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let arrived = 0;
+  return {
+    async wait(): Promise<void> {
+      arrived += 1;
+      if (arrived === count) release();
+      await open;
+    },
+  };
+}
+
+function startSession(id: string, requestId: string) {
+  return sendCommand({
+    command: 'transition',
+    performanceId: id,
+    status: 'running',
+    expectedVersion: 1,
+    requestId,
+  });
+}
+
+describe('performance console — global cross-session request-id dedup', () => {
+  it('same requestId racing on two sessions commits on exactly one of them', async () => {
+    const a = await createSession('场次 A', 'req-gs-1');
+    const b = await createSession('场次 B', 'req-gs-2');
+    await startSession(a.id, 'req-gs-3');
+    await startSession(b.id, 'req-gs-4');
+
+    // Group 1: two sessions, one request id, one sync barrier.
+    const shared = 'req-gs-race-cue';
+    const sync = barrier(2);
+    const [resA, resB] = await Promise.all([
+      sync.wait().then(() =>
+        sendCommand({
+          command: 'registerCue',
+          performanceId: a.id,
+          cue: 111,
+          expectedVersion: 2,
+          requestId: shared,
+        }),
+      ),
+      sync.wait().then(() =>
+        sendCommand({
+          command: 'registerCue',
+          performanceId: b.id,
+          cue: 222,
+          expectedVersion: 2,
+          requestId: shared,
+        }),
+      ),
+    ]);
+
+    const committed = [resA, resB].filter((r) => r.statusCode === 200);
+    const duplicates = [resA, resB].filter(
+      (r) => r.statusCode === 409 && r.json().error.reason === 'DUPLICATE_REQUEST',
+    );
+    expect(committed).toHaveLength(1);
+    expect(duplicates).toHaveLength(1);
+
+    const winnerId = committed[0]!.json().performance.id;
+    const loserId = winnerId === a.id ? b.id : a.id;
+
+    // Loser session: no version growth, no cue.
+    const loser = (await getPerformance(loserId)).json().performance;
+    expect(loser.version).toBe(2);
+    expect(loser.cues).toEqual([]);
+
+    // Winner session: exactly one version step and one cue.
+    const winner = (await getPerformance(winnerId)).json().performance;
+    expect(winner.version).toBe(3);
+    expect(winner.cues).toEqual([winnerId === a.id ? 111 : 222]);
+
+    // Global attribution: every later replay names the first owner.
+    for (const target of [a.id, b.id]) {
+      const replay = await sendCommand({
+        command: 'registerCue',
+        performanceId: target,
+        cue: 333,
+        expectedVersion: 99,
+        requestId: shared,
+      });
+      expect(replay.statusCode).toBe(409);
+      expectRejected(replay.json(), 'DUPLICATE_REQUEST');
+      expect(replay.json().error.message).toContain(winnerId);
+    }
+  });
+
+  it('same requestId racing on two transitions (pending -> running) commits once', async () => {
+    const a = await createSession('推进 A', 'req-gt-1');
+    const b = await createSession('推进 B', 'req-gt-2');
+
+    const shared = 'req-gt-race-transition';
+    const sync = barrier(2);
+    const [resA, resB] = await Promise.all([
+      sync.wait().then(() =>
+        sendCommand({
+          command: 'transition',
+          performanceId: a.id,
+          status: 'running',
+          expectedVersion: 1,
+          requestId: shared,
+        }),
+      ),
+      sync.wait().then(() =>
+        sendCommand({
+          command: 'transition',
+          performanceId: b.id,
+          status: 'running',
+          expectedVersion: 1,
+          requestId: shared,
+        }),
+      ),
+    ]);
+
+    expect([resA, resB].filter((r) => r.statusCode === 200)).toHaveLength(1);
+    const dup = [resA, resB].filter(
+      (r) => r.json().error?.reason === 'DUPLICATE_REQUEST',
+    );
+    expect(dup).toHaveLength(1);
+
+    const states = [
+      (await getPerformance(a.id)).json().performance,
+      (await getPerformance(b.id)).json().performance,
+    ];
+    expect(states.filter((s) => s.status === 'running' && s.version === 2)).toHaveLength(1);
+    expect(states.filter((s) => s.status === 'pending' && s.version === 1)).toHaveLength(1);
+  });
+
+  it('same requestId racing between create and modify wins on exactly one side', async () => {
+    // Group 2: create-new vs modify-existing share one request id.
+    const existing = await createSession('既有场次', 'req-gc-1');
+
+    const shared = 'req-gc-race-create-vs-modify';
+    const sync = barrier(2);
+    const [createRes, modifyRes] = await Promise.all([
+      sync.wait().then(() =>
+        sendCommand({ command: 'create', name: '并发新场次', requestId: shared }),
+      ),
+      sync.wait().then(() =>
+        sendCommand({
+          command: 'transition',
+          performanceId: existing.id,
+          status: 'running',
+          expectedVersion: 1,
+          requestId: shared,
+        }),
+      ),
+    ]);
+
+    const successes = [createRes, modifyRes].filter((r) => r.statusCode === 200);
+    expect(successes).toHaveLength(1);
+    expect(
+      [createRes, modifyRes].filter(
+        (r) => r.json().error?.reason === 'DUPLICATE_REQUEST',
+      ),
+    ).toHaveLength(1);
+
+    // The first (and only) owner is whichever side committed; replays must
+    // agree with that outcome regardless of the targeted session.
+    const ownerId =
+      createRes.statusCode === 200
+        ? createRes.json().performance.id
+        : existing.id;
+    const replay = await sendCommand({
+      command: 'transition',
+      performanceId: existing.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: shared,
+    });
+    expect(replay.statusCode).toBe(409);
+    expectRejected(replay.json(), 'DUPLICATE_REQUEST');
+    expect(replay.json().error.message).toContain(ownerId);
+
+    const after = (await getPerformance(existing.id)).json().performance;
+    if (createRes.statusCode === 200) {
+      // Create won: the existing session was never modified.
+      expect(after).toMatchObject({ status: 'pending', version: 1, cues: [] });
+      const created = (await getPerformance(createRes.json().performance.id)).json()
+        .performance;
+      expect(created).toMatchObject({ name: '并发新场次', version: 1 });
+    } else {
+      // Modify won: no second session was created and the existing one advanced.
+      expect(after).toMatchObject({ status: 'running', version: 2 });
+      expect(createRes.json().performance).toBeUndefined();
+    }
+  });
+
+  it('a committed id retargeted to another session (existing or missing) is a stable duplicate', async () => {
+    // Group 3: first owner is session A; every replay says so, even when the
+    // new target is a different session or a nonexistent one.
+    const a = await createSession('归属 A', 'req-gr-1');
+    const b = await createSession('目标 B', 'req-gr-2');
+    const firstCommit = await startSession(a.id, 'req-gr-shared');
+    expect(firstCommit.statusCode).toBe(200);
+    const ownerRequestId = firstCommit.json().performance.requestId;
+
+    // Replay against a different, otherwise-valid target session.
+    const toB = await sendCommand({
+      command: 'transition',
+      performanceId: b.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: ownerRequestId,
+    });
+    expect(toB.statusCode).toBe(409);
+    expectRejected(toB.json(), 'DUPLICATE_REQUEST');
+    expect(toB.json().error.message).toContain(a.id);
+    expect(toB.json().error.message).not.toContain(b.id);
+
+    // Replay against a nonexistent session: duplicate verdict must win over
+    // SESSION_NOT_FOUND and keep pointing at the first owner.
+    const toMissing = await sendCommand({
+      command: 'transition',
+      performanceId: 'no-such-session-global',
+      status: 'running',
+      expectedVersion: 1,
+      requestId: ownerRequestId,
+    });
+    expect(toMissing.statusCode).toBe(409);
+    expect(toMissing.json().error.code).toBe('COMMAND_REJECTED');
+    expectRejected(toMissing.json(), 'DUPLICATE_REQUEST');
+    expect(toMissing.json().error.message).toContain(a.id);
+
+    // Replay against the original target yields the same stable conclusion.
+    const toA = await sendCommand({
+      command: 'transition',
+      performanceId: a.id,
+      status: 'paused',
+      expectedVersion: 2,
+      requestId: ownerRequestId,
+    });
+    expect(toA.statusCode).toBe(409);
+    expectRejected(toA.json(), 'DUPLICATE_REQUEST');
+
+    // No side effects anywhere: B untouched, A not paused.
+    expect((await getPerformance(b.id)).json().performance).toMatchObject({
+      status: 'pending',
+      version: 1,
+      cues: [],
+    });
+    expect((await getPerformance(a.id)).json().performance).toMatchObject({
+      status: 'running',
+      version: 2,
+    });
+
+    // A genuinely fresh id against a nonexistent session is still 404.
+    const freshMissing = await sendCommand({
+      command: 'transition',
+      performanceId: 'no-such-session-global',
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-gr-fresh',
+    });
+    expect(freshMissing.statusCode).toBe(404);
+    expect(freshMissing.json().error.code).toBe('SESSION_NOT_FOUND');
+
+    // And that 404 did not consume the id: it commits elsewhere afterwards.
+    const retryElsewhere = await sendCommand({
+      command: 'transition',
+      performanceId: b.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-gr-fresh',
+    });
+    expect(retryElsewhere.statusCode).toBe(200);
+    expect(retryElsewhere.json().performance).toMatchObject({
+      status: 'running',
+      version: 2,
+      requestId: 'req-gr-fresh',
+    });
+  });
+
+  it('keeps cross-session parallel commits working when request ids differ', async () => {
+    const a = await createSession('并行 A', 'req-gp-1');
+    const b = await createSession('并行 B', 'req-gp-2');
+    await startSession(a.id, 'req-gp-3');
+    await startSession(b.id, 'req-gp-4');
+
+    const sync = barrier(2);
+    const [resA, resB] = await Promise.all([
+      sync.wait().then(() =>
+        sendCommand({
+          command: 'registerCue',
+          performanceId: a.id,
+          cue: 1,
+          expectedVersion: 2,
+          requestId: 'req-gp-5',
+        }),
+      ),
+      sync.wait().then(() =>
+        sendCommand({
+          command: 'registerCue',
+          performanceId: b.id,
+          cue: 2,
+          expectedVersion: 2,
+          requestId: 'req-gp-6',
+        }),
+      ),
+    ]);
+
+    expect(resA.statusCode).toBe(200);
+    expect(resB.statusCode).toBe(200);
+    expect((await getPerformance(a.id)).json().performance).toMatchObject({
+      version: 3,
+      cues: [1],
+    });
+    expect((await getPerformance(b.id)).json().performance).toMatchObject({
+      version: 3,
+      cues: [2],
+    });
+  });
+
+  it('releases a globally failed id so it can commit on another session after correction', async () => {
+    const a = await createSession('失败场 A', 'req-gx-1');
+    const b = await createSession('更正场 B', 'req-gx-2');
+
+    const shared = 'req-gx-correct-retry';
+
+    // Rejected on A (not running yet): id must not be consumed globally.
+    const rejected = await sendCommand({
+      command: 'registerCue',
+      performanceId: a.id,
+      cue: 7,
+      expectedVersion: 1,
+      requestId: shared,
+    });
+    expect(rejected.statusCode).toBe(409);
+    expectRejected(rejected.json(), 'NOT_RUNNING');
+
+    // Same id commits on B after B is started; the id's first owner is B.
+    await startSession(b.id, 'req-gx-3');
+    const committed = await sendCommand({
+      command: 'registerCue',
+      performanceId: b.id,
+      cue: 7,
+      expectedVersion: 2,
+      requestId: shared,
+    });
+    expect(committed.statusCode).toBe(200);
+    expect(committed.json().performance).toMatchObject({
+      version: 3,
+      cues: [7],
+      requestId: shared,
+    });
+
+    // Now spent globally: replaying it at A is a duplicate attributed to B.
+    const replay = await sendCommand({
+      command: 'registerCue',
+      performanceId: a.id,
+      cue: 7,
+      expectedVersion: 1,
+      requestId: shared,
+    });
+    expect(replay.statusCode).toBe(409);
+    expectRejected(replay.json(), 'DUPLICATE_REQUEST');
+    expect(replay.json().error.message).toContain(b.id);
+  });
+});
+
 describe('performance console — envelope validation', () => {
   it('malformed JSON -> 400 INVALID_JSON', async () => {
     const res = await app.inject({

@@ -5,7 +5,8 @@
 1. **演出场次控制台**：舞台监督创建场次（`待演`），开演后进入 `运行中`，
    可在运行与暂停间切换，运行时逐条登记整数 cue，结束后查看**封存的只读时间线**。
    所有变更携带 `expectedVersion`（乐观并发）与 `requestId`（请求去重），
-   经单场次串行裁决后一次提交；被拒绝时数据与版本保持不变。
+   经两级串行裁决——进程级全局准入（`requestId` 全局唯一）与单场次串行
+   裁决——后一次提交；被拒绝时数据与版本保持不变。
 2. **Cue 序列偏差校验**：在开演间隙核对**计划 cue 序列**与**现场触发序列**
    的偏差是否在容许阈值内。序列为 32 位有符号整数数组（各 ≤ 50000 项），
    阈值 K 为 0–500 的整数。
@@ -87,6 +88,8 @@ docker compose up --build --exit-code-from verify verify
 
 会话保存在服务端内存中（单实例）。场次字段：`id`、`name`、`status`、
 `version`、`requestId`（最近一次已提交命令的请求标识）、有序 `cues`。
+请求标识的全局归属（标识 → 首次提交的场次）由独立的进程级登记表维护，
+不随场次快照暴露。
 
 状态机（非法迁移一律拒绝）：
 
@@ -129,14 +132,28 @@ pending ──▶ running ◀──▶ paused
     "version": 3, "requestId": "uuid-3", "cues": [101] } }
 ```
 
-裁决规则（每条命令在该场次的串行队列中原子完成「读取—校验—写入」，
-要么提交一次，要么拒绝且数据、版本不变）：
+裁决采用两级串行：
+
+1. **进程级全局准入闸（FIFO）**：`requestId` 在**整个服务生命周期内全局唯一**，
+   不按场次划分。准入临界区内原子完成「查重/占用标识 + 进入该场次队列」；
+   同标识跨场次并发（含创建与既有场次修改并发）时，只有先到的一条能占用标识，
+   败方在准入阶段即以 `DUPLICATE_REQUEST` 被拒绝，**不触碰任一场次的状态、版本或
+   cue**。已提交的标识登记其**首次归属场次**，后续无论重放到哪一场次（乃至不存在
+   的场次）都稳定返回指向首次归属的 `DUPLICATE_REQUEST`，且重复判定优先于
+   `SESSION_NOT_FOUND`。
+2. **单场次串行链（读取—校验—写入原子完成）**：要么提交一次，要么拒绝且数据、
+   版本不变；被拒绝命令的标识占用会随拒绝释放，因此可更正条件后用同一标识重试。
+
+具体规则：
 
 - `expectedVersion` 与当前版本不一致 → `VERSION_CONFLICT`；
 - 状态不在合法迁移表内 → `ILLEGAL_TRANSITION`；
 - 非 `running` 态登记 cue → `NOT_RUNNING`；
-- `requestId` 已提交过（含创建命令与并发重放）→ `DUPLICATE_REQUEST`，
-  重复请求没有任何副作用。
+- `requestId` 已提交过（跨场次、含创建命令与并发重放；或同标识另有命令在途）
+  → `DUPLICATE_REQUEST`，重复请求没有任何副作用，错误信息始终指明首次归属场次；
+  重放目标不存在时仍为 `DUPLICATE_REQUEST`（不会先返回 `SESSION_NOT_FOUND`）。
+- 全新 `requestId` 引用不存在的场次时仍为 404 `SESSION_NOT_FOUND`，且该拒绝
+  不消耗标识，更正目标后可照常提交。
 
 ### `GET /api/performances/:id`
 
@@ -150,7 +167,7 @@ React 端唯一的读入口，按 ID 载入快照（刷新页面后据此恢复�
 
 | 状态码 | code | reason | 含义 |
 | ------ | ---- | ------ | ---- |
-| 404 | `SESSION_NOT_FOUND` | — | 查询或命令引用了不存在的场次 |
+| 404 | `SESSION_NOT_FOUND` | — | 查询或命令引用了不存在的场次（**已提交** requestId 的重放除外：恒为 409 `DUPLICATE_REQUEST` 并指向首次归属） |
 | 409 | `COMMAND_REJECTED` | `ILLEGAL_TRANSITION` | 非法状态迁移 |
 | 409 | `COMMAND_REJECTED` | `NOT_RUNNING` | 非运行态登记 cue |
 | 409 | `COMMAND_REJECTED` | `DUPLICATE_REQUEST` | 请求标识重复 |
@@ -163,7 +180,8 @@ React 端唯一的读入口，按 ID 载入快照（刷新页面后据此恢复�
 
 ```bash
 # 服务端：类型检查 + Vitest（算法边界、随机对拍、5 万项样本、API 校验、
-# 场次状态机、同版本并发仅一条提交与重复请求无副作用）
+# 场次状态机、同版本并发仅一条提交、失败后同标识可重试，以及跨场次/创建与
+# 修改/换目标重放三组屏障交错下的全局 requestId 唯一归属）
 cd server && npm install && npm test
 
 # 前端（开发服务器代理 /api 到 localhost:3000）

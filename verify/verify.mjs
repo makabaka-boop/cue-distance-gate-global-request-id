@@ -8,7 +8,10 @@
  *   4. the web page and its /api proxy integration,
  *   5. the performance session console lifecycle through the web proxy,
  *      including refresh reload and the sealed read-only timeline,
- *   6. the host-published WEB_PORT override reaches the same stack.
+ *   6. process-wide request-id dedup: barrier-interleaved races across two
+ *      sessions, create-vs-modify and committed-id retargeting (stable first
+ *      ownership, no loser side effects, consistent duplicate verdict),
+ *   7. the host-published WEB_PORT override reaches the same stack.
  *
  * Exits 0 when every check passes, 1 otherwise.
  */
@@ -612,7 +615,327 @@ let perfId;
   );
 }
 
-console.log('\n[6] published WEB_PORT override');
+console.log('\n[6] global cross-session request-id dedup');
+
+// An N-party synchronous barrier: no party proceeds until every party has
+// arrived, so the paired requests are genuinely interleaved on the wire.
+function makeBarrier(count) {
+  let arrived = 0;
+  let release = null;
+  const open = new Promise((resolve) => {
+    release = resolve;
+  });
+  return {
+    async wait() {
+      arrived += 1;
+      if (arrived === count) release();
+      await open;
+    },
+  };
+}
+
+function expectDuplicate(name, res, ownerId, notId = null) {
+  const ok =
+    res.status === 409 &&
+    res.body?.error?.code === 'COMMAND_REJECTED' &&
+    res.body?.error?.reason === 'DUPLICATE_REQUEST' &&
+    res.body?.error?.message?.includes(ownerId) &&
+    (notId === null || !res.body?.error?.message?.includes(notId));
+  check(name, ok, `got ${res.status} ${JSON.stringify(res.body)} (owner=${ownerId})`);
+}
+
+{
+  // ---- Group 1: TWO SESSIONS racing on one request id --------------------
+  const a = await sendCommand(API_URL, {
+    command: 'create', name: '全局去重 A', requestId: commandRequestId('gd-a'),
+  });
+  const b = await sendCommand(API_URL, {
+    command: 'create', name: '全局去重 B', requestId: commandRequestId('gd-b'),
+  });
+  const idA = a.body.performance.id;
+  const idB = b.body.performance.id;
+
+  // 1a. Transition race: both sessions pending v1 -> running, same requestId.
+  const transitionId = commandRequestId('gd-transition');
+  const tBarrier = makeBarrier(2);
+  const tResults = await Promise.all([
+    tBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'transition', performanceId: idA, status: 'running',
+      expectedVersion: 1, requestId: transitionId,
+    })),
+    tBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'transition', performanceId: idB, status: 'running',
+      expectedVersion: 1, requestId: transitionId,
+    })),
+  ]);
+  const tWins = tResults.filter((r) => r.status === 200);
+  const tDups = tResults.filter(
+    (r) => r.status === 409 && r.body?.error?.reason === 'DUPLICATE_REQUEST',
+  );
+  check(
+    'transition race across two sessions: exactly one success',
+    tWins.length === 1 && tDups.length === 1,
+    `statuses=${tResults.map((r) => r.status).join(',')}`,
+  );
+  const tOwner = tWins[0]?.body.performance.id;
+  const tLoser = tOwner === idA ? idB : idA;
+  const tLoserSnap = (await getPerformance(API_URL, tLoser)).body.performance;
+  check(
+    'transition loser session stays pending v1 (no side effect)',
+    tLoserSnap.status === 'pending' && tLoserSnap.version === 1,
+    `got ${JSON.stringify(tLoserSnap)}`,
+  );
+
+  // Bring the loser up with a fresh id so both sessions are running.
+  const loserStart = await sendCommand(API_URL, {
+    command: 'transition', performanceId: tLoser, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('gd-loserstarter'),
+  });
+  check('loser session can still be started with a fresh requestId',
+    loserStart.status === 200, `got ${loserStart.status}`);
+
+  // 1b. Cue race: both sessions running v2, same requestId, distinct cues.
+  const cueId = commandRequestId('gd-cue');
+  const cBarrier = makeBarrier(2);
+  const cResults = await Promise.all([
+    cBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'registerCue', performanceId: idA, cue: 10001,
+      expectedVersion: 2, requestId: cueId,
+    })),
+    cBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'registerCue', performanceId: idB, cue: 20002,
+      expectedVersion: 2, requestId: cueId,
+    })),
+  ]);
+  const cWins = cResults.filter((r) => r.status === 200);
+  const cDups = cResults.filter(
+    (r) => r.status === 409 && r.body?.error?.reason === 'DUPLICATE_REQUEST',
+  );
+  check(
+    'cue race across two sessions: exactly one success, one duplicate',
+    cWins.length === 1 && cDups.length === 1,
+    `statuses=${cResults.map((r) => r.status).join(',')}`,
+  );
+  const cueOwner = cWins[0].body.performance.id;
+  const cueLoser = cueOwner === idA ? idB : idA;
+  const ownerSnap = (await getPerformance(API_URL, cueOwner)).body.performance;
+  const loserSnap = (await getPerformance(API_URL, cueLoser)).body.performance;
+  check(
+    'cue winner snapshot: v3 with exactly its own cue',
+    ownerSnap.version === 3 &&
+      ownerSnap.cues.length === 1 &&
+      ownerSnap.cues[0] === (cueOwner === idA ? 10001 : 20002),
+    `got ${JSON.stringify(ownerSnap)}`,
+  );
+  check(
+    'cue loser snapshot: v2 with no cues and no version growth',
+    loserSnap.version === 2 && loserSnap.cues.length === 0,
+    `got ${JSON.stringify(loserSnap)}`,
+  );
+
+  // Every later replay, at either target, resolves to the first owner.
+  expectDuplicate(
+    'cue id replayed at winning session -> duplicate attributed to winner',
+    await sendCommand(API_URL, {
+      command: 'registerCue', performanceId: cueOwner, cue: 1,
+      expectedVersion: 3, requestId: cueId,
+    }),
+    cueOwner,
+  );
+  expectDuplicate(
+    'cue id replayed at losing session -> duplicate still attributed to winner',
+    await sendCommand(API_URL, {
+      command: 'registerCue', performanceId: cueLoser, cue: 1,
+      expectedVersion: 2, requestId: cueId,
+    }),
+    cueOwner,
+    cueLoser,
+  );
+
+  // ---- Group 2: CREATE vs MODIFY racing on one request id ----------------
+  const existing = await sendCommand(API_URL, {
+    command: 'create', name: '既有场次', requestId: commandRequestId('gd-existing'),
+  });
+  const idExisting = existing.body.performance.id;
+  const cmId = commandRequestId('gd-create-modify');
+  const cmBarrier = makeBarrier(2);
+  const cmResults = await Promise.all([
+    cmBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'create', name: '并发新场次', requestId: cmId,
+    })),
+    cmBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'transition', performanceId: idExisting, status: 'running',
+      expectedVersion: 1, requestId: cmId,
+    })),
+  ]);
+  const cmWins = cmResults.filter((r) => r.status === 200);
+  const cmDups = cmResults.filter(
+    (r) => r.status === 409 && r.body?.error?.reason === 'DUPLICATE_REQUEST',
+  );
+  check(
+    'create vs modify race: exactly one side succeeds',
+    cmWins.length === 1 && cmDups.length === 1,
+    `statuses=${cmResults.map((r) => r.status).join(',')}`,
+  );
+  const cmOwner =
+    cmWins[0].body.performance?.id === idExisting
+      ? idExisting
+      : cmWins[0].body.performance.id;
+  const existingSnap = (await getPerformance(API_URL, idExisting)).body.performance;
+  if (cmResults[0].status === 200) {
+    check(
+      'create won: new session exists pending v1, existing session untouched',
+      cmOwner !== idExisting &&
+        existingSnap.status === 'pending' &&
+        existingSnap.version === 1 &&
+        existingSnap.cues.length === 0,
+      `owner=${cmOwner} existing=${JSON.stringify(existingSnap)}`,
+    );
+    const createdSnap = (await getPerformance(API_URL, cmOwner)).body.performance;
+    check(
+      'create winner snapshot is the newly created session',
+      createdSnap.name === '并发新场次' && createdSnap.version === 1,
+      `got ${JSON.stringify(createdSnap)}`,
+    );
+  } else {
+    check(
+      'modify won: existing session advanced to running v2, no session created',
+      cmOwner === idExisting &&
+        existingSnap.status === 'running' &&
+        existingSnap.version === 2 &&
+        cmResults[0].body?.performance === undefined,
+      `existing=${JSON.stringify(existingSnap)} createBody=${JSON.stringify(cmResults[0].body)}`,
+    );
+  }
+  expectDuplicate(
+    'create-vs-modify id replayed -> duplicate attributed to sole owner',
+    await sendCommand(API_URL, {
+      command: 'transition', performanceId: idExisting, status: 'paused',
+      expectedVersion: existingSnap.version, requestId: cmId,
+    }),
+    cmOwner,
+  );
+
+  // ---- Group 3: COMMITTED ID RETARGETED TO ANOTHER / MISSING SESSION -----
+  const sessX = await sendCommand(API_URL, {
+    command: 'create', name: '首次归属 X', requestId: commandRequestId('gd-x'),
+  });
+  const idX = sessX.body.performance.id;
+  const sessY = await sendCommand(API_URL, {
+    command: 'create', name: '重放目标 Y', requestId: commandRequestId('gd-y'),
+  });
+  const idY = sessY.body.performance.id;
+
+  // The id is first (and only) committed onto X by the start transition.
+  const ownedId = commandRequestId('gd-owned');
+  const startX = await sendCommand(API_URL, {
+    command: 'transition', performanceId: idX, status: 'running',
+    expectedVersion: 1, requestId: ownedId,
+  });
+  check('ownership commit on X -> running v2',
+    startX.status === 200 && startX.body.performance.version === 2,
+    `got ${startX.status} ${JSON.stringify(startX.body)}`);
+
+  // Retarget to a different, otherwise-valid session.
+  expectDuplicate(
+    'committed id replayed at session Y -> DUPLICATE_REQUEST naming X',
+    await sendCommand(API_URL, {
+      command: 'transition', performanceId: idY, status: 'running',
+      expectedVersion: 1, requestId: ownedId,
+    }),
+    idX,
+    idY,
+  );
+
+  // Retarget to a nonexistent session: duplicate verdict must win over
+  // SESSION_NOT_FOUND and stay consistent with the other targets.
+  expectDuplicate(
+    'committed id replayed at missing session -> DUPLICATE_REQUEST naming X (not 404)',
+    await sendCommand(API_URL, {
+      command: 'transition', performanceId: 'no-such-session-gd', status: 'running',
+      expectedVersion: 1, requestId: ownedId,
+    }),
+    idX,
+  );
+
+  // Original target gives the same stable conclusion as the other targets.
+  expectDuplicate(
+    'committed id replayed at owner X -> same DUPLICATE_REQUEST verdict',
+    await sendCommand(API_URL, {
+      command: 'transition', performanceId: idX, status: 'paused',
+      expectedVersion: 2, requestId: ownedId,
+    }),
+    idX,
+  );
+
+  const ySnap = (await getPerformance(API_URL, idY)).body.performance;
+  const xSnap = (await getPerformance(API_URL, idX)).body.performance;
+  check(
+    'replays change neither session: Y pending v1, X stays running v2',
+    ySnap.status === 'pending' && ySnap.version === 1 && ySnap.cues.length === 0 &&
+      xSnap.status === 'running' && xSnap.version === 2,
+    `X=${JSON.stringify(xSnap)} Y=${JSON.stringify(ySnap)}`,
+  );
+
+  // A genuinely fresh id at a missing session keeps the 404 envelope ...
+  const freshMissing = await sendCommand(API_URL, {
+    command: 'transition', performanceId: 'no-such-session-gd', status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('gd-fresh-missing'),
+  });
+  check(
+    'fresh requestId at missing session -> 404 SESSION_NOT_FOUND (compatibility)',
+    freshMissing.status === 404 && freshMissing.body?.error?.code === 'SESSION_NOT_FOUND',
+    `got ${freshMissing.status} ${JSON.stringify(freshMissing.body)}`,
+  );
+
+  // ... and that rejection does not consume the id: after correcting the
+  // target it commits on session Y.
+  const reusableId = commandRequestId('gd-recover');
+  const badFirst = await sendCommand(API_URL, {
+    command: 'registerCue', performanceId: idY, cue: 9090,
+    expectedVersion: 1, requestId: reusableId,
+  });
+  check(
+    'cue at pending Y rejected as NOT_RUNNING without consuming the id',
+    badFirst.status === 409 && badFirst.body?.error?.reason === 'NOT_RUNNING',
+    `got ${badFirst.status} ${JSON.stringify(badFirst.body)}`,
+  );
+  await sendCommand(API_URL, {
+    command: 'transition', performanceId: idY, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('gd-y-start'),
+  });
+  const recovered = await sendCommand(API_URL, {
+    command: 'registerCue', performanceId: idY, cue: 9090,
+    expectedVersion: 2, requestId: reusableId,
+  });
+  check(
+    'corrected retry with the same requestId commits on Y -> v3 cue 9090',
+    recovered.status === 200 &&
+      recovered.body.performance.version === 3 &&
+      JSON.stringify(recovered.body.performance.cues) === '[9090]',
+    `got ${recovered.status} ${JSON.stringify(recovered.body)}`,
+  );
+
+  // Different request ids on different sessions still commit in parallel.
+  const parBarrier = makeBarrier(2);
+  const parallel = await Promise.all([
+    parBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'registerCue', performanceId: idX, cue: 41,
+      expectedVersion: 2, requestId: commandRequestId('gd-par-x'),
+    })),
+    parBarrier.wait().then(() => sendCommand(API_URL, {
+      command: 'registerCue', performanceId: idY, cue: 42,
+      expectedVersion: 3, requestId: commandRequestId('gd-par-y'),
+    })),
+  ]);
+  check(
+    'distinct requestIds across sessions: both parallel commits succeed',
+    parallel.every((r) => r.status === 200),
+    `statuses=${parallel.map((r) => r.status).join(',')}`,
+  );
+}
+
+console.log('\n[7] published WEB_PORT override');
 {
   const webPort = process.env.WEB_PORT ?? '8080';
   // In compose the published host port is reached via host-gateway; a local

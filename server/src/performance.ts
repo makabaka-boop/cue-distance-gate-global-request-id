@@ -9,11 +9,22 @@
  *   requestId - id of the last command that was committed to the session
  *   cues      - ordered int32 cues registered while the session is running
  *
- * Every command is adjudicated serially *per session* (a CREATE chain plus
- * one chain per session id): validation, precondition checks and the state
- * mutation happen in one synchronous critical section, so each command is
- * either committed exactly once or rejected with the stored data and
- * version untouched.
+ * Two-level serial adjudication:
+ *
+ *   1. A single process-wide FIFO *admission gate*. Request ids are a global
+ *      commitment for the whole service lifetime: the same requestId may be
+ *      committed exactly once, regardless of which session (or the create
+ *      chain) it targets. Inside one synchronous gate slot a command either
+ *      claims its request id and is enqueued onto its session chain, or is
+ *      rejected as a duplicate. Two commands racing on different session
+ *      chains therefore cannot both pass the duplicate check: the loser is
+ *      rejected at admission and never touches any session.
+ *   2. A per-session serial chain (a CREATE chain plus one chain per session
+ *      id) in which validation, precondition checks and the state mutation
+ *      happen as one synchronous step, so each admitted command is either
+ *      committed exactly once or rejected with the stored data and version
+ *      untouched. A rejection releases the id claim, so the caller may
+ *      correct the precondition and replay the very same request id.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -73,6 +84,21 @@ const LEGAL_TRANSITIONS: Record<PerformanceStatus, readonly PerformanceStatus[]>
 
 const CREATE_CHAIN_KEY = '__create__';
 
+/** A claimed request id: held in flight while adjudicating, then frozen at commit. */
+interface InFlightClaim {
+  state: 'inflight';
+}
+
+interface CommittedClaim {
+  state: 'committed';
+  /** Session that the request id was first (and only) committed to. */
+  sessionId: string;
+}
+
+type RequestClaim = InFlightClaim | CommittedClaim;
+
+const INFLIGHT_CLAIM: InFlightClaim = { state: 'inflight' };
+
 function reject(reason: RejectReason, message: string): never {
   throw new ApiError('COMMAND_REJECTED', message, 409, reason);
 }
@@ -80,31 +106,74 @@ function reject(reason: RejectReason, message: string): never {
 export class PerformanceStore {
   private readonly sessions = new Map<string, Performance>();
   private readonly chains = new Map<string, Promise<unknown>>();
-  // requestId of every *committed* command -> session id (null: create).
-  private readonly committedRequests = new Map<string, string | null>();
+  // Process-wide request-id claims: one entry per claimed id, global across
+  // every session and the create chain. Only committed ids outlive a command.
+  private readonly claims = new Map<string, RequestClaim>();
+  // Tail of the process-wide FIFO admission gate.
+  private gate: Promise<void> = Promise.resolve();
+
+  /**
+   * Run `task` in one synchronous slot of the process-wide admission gate.
+   * Gate slots are FIFO and release as soon as `task` returns (the returned
+   * adjudication promise is chained afterwards), so cross-session commands
+   * still run their state work in parallel on their own session chains.
+   */
+  private admit(task: () => void): Promise<void> {
+    const previous = this.gate;
+    let release!: () => void;
+    const slotGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.gate = previous.then(() => slotGate, () => slotGate);
+    return previous.then(
+      () => {
+        try {
+          task();
+        } finally {
+          release();
+        }
+      },
+      // A prior slot's rejection is delivered to its own caller.
+      () => {
+        try {
+          task();
+        } finally {
+          release();
+        }
+      },
+    );
+  }
 
   /** Run `task` in the serial adjudication chain of one session. */
-  private async runExclusive<T>(key: string, task: () => T): Promise<T> {
+  private runExclusive<T>(key: string, task: () => T): Promise<T> {
     const previous = this.chains.get(key) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const slot = previous.then(() => gate);
+    const slot = previous.then(() => gate, () => gate);
     this.chains.set(key, slot);
-    try {
-      await previous;
-    } catch {
-      // A prior task's rejection is delivered to its own caller.
-    }
-    try {
-      return task();
-    } finally {
-      release();
-      // Remove the chain only if nobody queued behind us; otherwise the
-      // last waiter performs the cleanup.
-      if (this.chains.get(key) === slot) this.chains.delete(key);
-    }
+    const work = previous.then(
+      () => {
+        try {
+          return task();
+        } finally {
+          release();
+          // Remove the chain only if nobody queued behind us; otherwise the
+          // last waiter performs the cleanup.
+          if (this.chains.get(key) === slot) this.chains.delete(key);
+        }
+      },
+      () => {
+        try {
+          return task();
+        } finally {
+          release();
+          if (this.chains.get(key) === slot) this.chains.delete(key);
+        }
+      },
+    );
+    return work as Promise<T>;
   }
 
   get(id: string): Performance {
@@ -120,23 +189,64 @@ export class PerformanceStore {
   }
 
   dispatch(command: PerformanceCommand): Promise<Performance> {
-    const key = command.type === 'create' ? CREATE_CHAIN_KEY : command.performanceId;
-    return this.runExclusive(key, () => this.decide(command));
+    // Claiming the id and joining the session chain must be one atomic step
+    // in gate order: otherwise two commands on different chains could both
+    // observe "unclaimed" and both commit.
+    let work: Promise<Performance> | undefined;
+    return this.admit(() => {
+      const claim = this.claims.get(command.requestId);
+      if (claim) throw this.duplicateError(command.requestId, claim);
+      this.claims.set(command.requestId, INFLIGHT_CLAIM);
+
+      const key = command.type === 'create' ? CREATE_CHAIN_KEY : command.performanceId;
+      work = this.runExclusive(key, () => this.decideGuarded(command));
+    }).then(() => work as Promise<Performance>);
+  }
+
+  /**
+   * Run the decision and finalise the global claim: freeze it to the owning
+   * session on commit, or release it on any rejection so the request id can
+   * be corrected and replayed.
+   */
+  private decideGuarded(command: PerformanceCommand): Performance {
+    try {
+      const result = this.decide(command);
+      this.claims.set(command.requestId, { state: 'committed', sessionId: result.id });
+      return result;
+    } catch (err) {
+      this.claims.delete(command.requestId);
+      throw err;
+    }
+  }
+
+  /**
+   * Stable duplicate verdict. A committed id always reports its *first*
+   * owner, even when replayed against another (or a nonexistent) session;
+   * an in-flight id means the caller lost a same-id concurrency race.
+   */
+  private duplicateError(requestId: string, claim: RequestClaim): ApiError {
+    const attribution =
+      claim.state === 'committed'
+        ? ` It was first committed to performance session "${claim.sessionId}".`
+        : ' Another command with the same request id is in flight concurrently.';
+    return new ApiError(
+      'COMMAND_REJECTED',
+      `Request id "${requestId}" has already been used for a successful command;` +
+        ` a request id can be committed exactly once for the lifetime of the service.` +
+        attribution,
+      409,
+      'DUPLICATE_REQUEST',
+    );
   }
 
   /**
    * The decision procedure. Runs inside the per-session chain, so the whole
    * read-check-write sequence is one atomic step. All throws leave the store
-   * untouched (nothing is mutated before the single commit at the end).
+   * untouched (nothing is mutated before the single commit at the end), and
+   * decideGuarded releases the id claim on the way out.
    */
   private decide(command: PerformanceCommand): Performance {
     if (command.type === 'create') {
-      if (this.committedRequests.has(command.requestId)) {
-        reject(
-          'DUPLICATE_REQUEST',
-          `Request id "${command.requestId}" was already committed.`,
-        );
-      }
       const session: Performance = {
         id: randomUUID(),
         name: command.name,
@@ -146,7 +256,6 @@ export class PerformanceStore {
         cues: [],
       };
       this.sessions.set(session.id, session);
-      this.committedRequests.set(command.requestId, session.id);
       return this.snapshot(session);
     }
 
@@ -156,18 +265,6 @@ export class PerformanceStore {
         'SESSION_NOT_FOUND',
         `No performance session exists with id "${command.performanceId}".`,
         404,
-      );
-    }
-
-    // Only *committed* request ids count as duplicates. A rejected command
-    // leaves the store untouched, so its request id is never recorded: the
-    // caller may correct the precondition (version/transition/run-state)
-    // and replay the very same request id without being falsely reported as
-    // a duplicate. Recording happens exclusively at the commit point below.
-    if (this.committedRequests.has(command.requestId)) {
-      reject(
-        'DUPLICATE_REQUEST',
-        `Request id "${command.requestId}" was already committed to session "${session.id}".`,
       );
     }
 
@@ -196,11 +293,11 @@ export class PerformanceStore {
       session.cues.push(command.cue);
     }
 
-    // Single commit point: version bump and request-id recording happen
-    // together with the state change.
+    // Single commit point: version bump and last-request-id stamp happen
+    // together with the state change. The global id claim is frozen by
+    // decideGuarded immediately after this returns.
     session.version += 1;
     session.requestId = command.requestId;
-    this.committedRequests.set(command.requestId, session.id);
     return this.snapshot(session);
   }
 
