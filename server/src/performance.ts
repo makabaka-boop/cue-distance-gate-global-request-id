@@ -9,11 +9,26 @@
  *   requestId - id of the last command that was committed to the session
  *   cues      - ordered int32 cues registered while the session is running
  *
- * Every command is adjudicated serially *per session* (a CREATE chain plus
- * one chain per session id): validation, precondition checks and the state
- * mutation happen in one synchronous critical section, so each command is
- * either committed exactly once or rejected with the stored data and
- * version untouched.
+ * Every command passes through two serialisation points:
+ *
+ *   1. a *request-id chain*, global across the whole service. A given
+ *      requestId is adjudicated by at most one command at a time, so the
+ *      "already committed?" check and the commit cannot interleave between
+ *      two sessions (or between a create and a command on an existing
+ *      session). This is what makes the deduplication promise global:
+ *      one requestId maps to at most one successful commit for the entire
+ *      life of the service, regardless of the target session.
+ *
+ *   2. the *session chain* (a CREATE chain plus one chain per session id),
+ *      held for the duration of the request-id slot: validation,
+ *      precondition checks and the state mutation happen in one
+ *      synchronous critical section, so each command is either committed
+ *      exactly once or rejected with the stored data and version
+ *      untouched.
+ *
+ * Commands with different request ids never share a request-id slot, so
+ * commands against different sessions still proceed in parallel; only the
+ * per-session ordering (and equal-id contenders) are serialised.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -77,33 +92,54 @@ function reject(reason: RejectReason, message: string): never {
   throw new ApiError('COMMAND_REJECTED', message, 409, reason);
 }
 
+/**
+ * Reject a replay of an already-committed request id. The message always
+ * names the session the id *first* committed to (its stable global owner),
+ * never the session the replay happened to target, so audit logs and
+ * client retries see the same conclusion from every target.
+ */
+function rejectDuplicate(requestId: string, ownerId: string): never {
+  reject(
+    'DUPLICATE_REQUEST',
+    `Request id "${requestId}" was already committed to session "${ownerId}".`,
+  );
+}
+
 export class PerformanceStore {
   private readonly sessions = new Map<string, Performance>();
   private readonly chains = new Map<string, Promise<unknown>>();
-  // requestId of every *committed* command -> session id (null: create).
-  private readonly committedRequests = new Map<string, string | null>();
+  /** Serial chain per requestId: one adjudication per id at a time, globally. */
+  private readonly requestChains = new Map<string, Promise<unknown>>();
+  // requestId of every *committed* command -> id of the session it first
+  // committed to. Global, so a duplicate is detected no matter which
+  // session (or create) it is replayed against afterwards.
+  private readonly committedRequests = new Map<string, string>();
 
-  /** Run `task` in the serial adjudication chain of one session. */
-  private async runExclusive<T>(key: string, task: () => T): Promise<T> {
-    const previous = this.chains.get(key) ?? Promise.resolve();
+  /** Run `task` serially at the end of the chain keyed by `key`. */
+  private async runExclusive<T>(
+    chains: Map<string, Promise<unknown>>,
+    key: string,
+    task: () => T | Promise<T>,
+  ): Promise<T> {
+    const previous = chains.get(key) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const slot = previous.then(() => gate);
-    this.chains.set(key, slot);
+    chains.set(key, slot);
     try {
       await previous;
     } catch {
       // A prior task's rejection is delivered to its own caller.
     }
     try {
-      return task();
+      return await task();
     } finally {
       release();
       // Remove the chain only if nobody queued behind us; otherwise the
       // last waiter performs the cleanup.
-      if (this.chains.get(key) === slot) this.chains.delete(key);
+      if (chains.get(key) === slot) chains.delete(key);
     }
   }
 
@@ -120,23 +156,39 @@ export class PerformanceStore {
   }
 
   dispatch(command: PerformanceCommand): Promise<Performance> {
-    const key = command.type === 'create' ? CREATE_CHAIN_KEY : command.performanceId;
-    return this.runExclusive(key, () => this.decide(command));
+    // The global request-id slot wraps the per-session adjudication. Two
+    // commands sharing an id cannot run their decide() sections at the
+    // same time, so a cross-session loser always observes the winner's
+    // committed id; the loser never touches any session.
+    return this.runExclusive(this.requestChains, command.requestId, async () => {
+      // Fast path: the id may have committed long before this request
+      // arrived; reject without even entering the session chain.
+      const owner = this.committedRequests.get(command.requestId);
+      if (owner !== undefined) rejectDuplicate(command.requestId, owner);
+      const key = command.type === 'create' ? CREATE_CHAIN_KEY : command.performanceId;
+      return await this.runExclusive(this.chains, key, () => this.decide(command));
+    });
   }
 
   /**
-   * The decision procedure. Runs inside the per-session chain, so the whole
-   * read-check-write sequence is one atomic step. All throws leave the store
-   * untouched (nothing is mutated before the single commit at the end).
+   * The decision procedure. Runs inside the request-id slot and the
+   * per-session chain, so the whole read-check-write sequence is one
+   * atomic step. All throws leave the store untouched (nothing is mutated
+   * before the single commit at the end).
    */
   private decide(command: PerformanceCommand): Performance {
+    // Rechecked inside every lock: an earlier contender (e.g. one queued
+    // on the same session chain for another reason) may have committed the
+    // id in the meantime. This check deliberately precedes the session
+    // lookup, so replaying a committed id at a missing session reports the
+    // duplicate instead of SESSION_NOT_FOUND, exactly like replaying it at
+    // any existing foreign session.
+    const ownerId = this.committedRequests.get(command.requestId);
+    if (ownerId !== undefined) {
+      rejectDuplicate(command.requestId, ownerId);
+    }
+
     if (command.type === 'create') {
-      if (this.committedRequests.has(command.requestId)) {
-        reject(
-          'DUPLICATE_REQUEST',
-          `Request id "${command.requestId}" was already committed.`,
-        );
-      }
       const session: Performance = {
         id: randomUUID(),
         name: command.name,
@@ -146,6 +198,8 @@ export class PerformanceStore {
         cues: [],
       };
       this.sessions.set(session.id, session);
+      // Single commit point for creates: the new session and the global
+      // id record appear together.
       this.committedRequests.set(command.requestId, session.id);
       return this.snapshot(session);
     }
@@ -164,12 +218,6 @@ export class PerformanceStore {
     // caller may correct the precondition (version/transition/run-state)
     // and replay the very same request id without being falsely reported as
     // a duplicate. Recording happens exclusively at the commit point below.
-    if (this.committedRequests.has(command.requestId)) {
-      reject(
-        'DUPLICATE_REQUEST',
-        `Request id "${command.requestId}" was already committed to session "${session.id}".`,
-      );
-    }
 
     if (command.expectedVersion !== session.version) {
       reject(

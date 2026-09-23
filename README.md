@@ -28,7 +28,7 @@
 | -------- | ---- |
 | `server` | Fastify API（容器内 3000 端口）：距离校验 + 场次命令裁决（内存存储） |
 | `web`    | React 静态页 + nginx `/api` 反向代理，宿主端口由 `WEB_PORT` 覆盖（默认 8080） |
-| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、宿主端口覆盖 |
+| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、同步屏障交错的跨场次全局 requestId 去重（两场次 / 创建与修改 / 已提交后换目标）、宿主端口覆盖 |
 
 ## 运行（Docker Compose）
 
@@ -129,14 +129,19 @@ pending ──▶ running ◀──▶ paused
     "version": 3, "requestId": "uuid-3", "cues": [101] } }
 ```
 
-裁决规则（每条命令在该场次的串行队列中原子完成「读取—校验—写入」，
-要么提交一次，要么拒绝且数据、版本不变）：
+裁决规则（命令先经**全局 requestId 串行槽**，再进入该场次的串行队列，
+在槽内原子完成「读取—校验—写入」，要么提交一次，要么拒绝且数据、版本不变）：
 
 - `expectedVersion` 与当前版本不一致 → `VERSION_CONFLICT`；
 - 状态不在合法迁移表内 → `ILLEGAL_TRANSITION`；
 - 非 `running` 态登记 cue → `NOT_RUNNING`；
-- `requestId` 已提交过（含创建命令与并发重放）→ `DUPLICATE_REQUEST`，
-  重复请求没有任何副作用。
+- `requestId` **在整个服务生命周期内全局唯一**：同一标识无论打向哪个场次
+  （或用于创建），都只对应一次成功提交。已提交标识的任何重放——换另一场次、
+  换一个不存在的场次、或改作创建命令——一律返回 `DUPLICATE_REQUEST`，拒绝信息
+  稳定指向该标识**首次提交归属的场次**，与重放目标无关，且没有任何副作用
+  （不会新建场次，目标场次的状态、版本、cue 均不变）。跨场次并发同标识时，
+  败方同样得到 `DUPLICATE_REQUEST`，不改变任一场次。仅**被拒绝**（版本冲突 /
+  非法迁移 / 非运行态等）的标识不会被记录，更正条件后仍可复用同一标识提交。
 
 ### `GET /api/performances/:id`
 
@@ -150,7 +155,7 @@ React 端唯一的读入口，按 ID 载入快照（刷新页面后据此恢复�
 
 | 状态码 | code | reason | 含义 |
 | ------ | ---- | ------ | ---- |
-| 404 | `SESSION_NOT_FOUND` | — | 查询或命令引用了不存在的场次 |
+| 404 | `SESSION_NOT_FOUND` | — | 查询或命令引用了不存在的场次（已提交过的 requestId 除外：其重放优先返回 `DUPLICATE_REQUEST`，即使目标场次不存在） |
 | 409 | `COMMAND_REJECTED` | `ILLEGAL_TRANSITION` | 非法状态迁移 |
 | 409 | `COMMAND_REJECTED` | `NOT_RUNNING` | 非运行态登记 cue |
 | 409 | `COMMAND_REJECTED` | `DUPLICATE_REQUEST` | 请求标识重复 |

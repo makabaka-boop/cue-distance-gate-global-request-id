@@ -519,6 +519,390 @@ describe('performance console — same-version concurrency', () => {
   });
 });
 
+describe('performance console — global cross-session request-id dedup', () => {
+  /**
+   * Cyclic barrier: every contender calls `hit()` after dispatching its
+   * request, then waits until the whole group is parked (plus a macrotask
+   * delay so every request has actually entered its adjudication chain)
+   * before anyone proceeds. The contenders therefore genuinely overlap
+   * inside the server rather than one finishing before the other starts.
+   */
+  class Barrier {
+    private readonly arrived: Array<() => void> = [];
+    private waiting = 0;
+    constructor(private readonly size: number) {}
+
+    hit(): Promise<void> {
+      const mine = new Promise<void>((resolve) => this.arrived.push(resolve));
+      this.waiting += 1;
+      if (this.waiting === this.size) {
+        const all = this.arrived.splice(0);
+        setTimeout(() => all.forEach((release) => release()), 5);
+      }
+      return mine;
+    }
+  }
+
+  /** Fire `payloads` together, each parking on the barrier before resolving. */
+  async function raceWithBarrier(payloads: unknown[], barrier: Barrier) {
+    return Promise.all(
+      payloads.map(async (payload) => {
+        const promise = sendCommand(payload);
+        await barrier.hit();
+        return promise;
+      }),
+    );
+  }
+
+  it('one id racing on two running sessions: exactly one cue commits, loser is DUPLICATE_REQUEST', async () => {
+    const a = await createSession('跨场次-A', 'req-x2s-ca');
+    const b = await createSession('跨场次-B', 'req-x2s-cb');
+    for (const s of [a, b]) {
+      const res = await sendCommand({
+        command: 'transition',
+        performanceId: s.id,
+        status: 'running',
+        expectedVersion: 1,
+        requestId: `req-x2s-start-${s.id}`,
+      });
+      expect(res.statusCode).toBe(200);
+    }
+
+    const sharedId = 'req-x2s-shared-cue';
+    const barrier = new Barrier(2);
+    const [resA, resB] = await raceWithBarrier(
+      [
+        {
+          command: 'registerCue',
+          performanceId: a.id,
+          cue: 11,
+          expectedVersion: 2,
+          requestId: sharedId,
+        },
+        {
+          command: 'registerCue',
+          performanceId: b.id,
+          cue: 22,
+          expectedVersion: 2,
+          requestId: sharedId,
+        },
+      ],
+      barrier,
+    );
+
+    const results = [resA, resB];
+    const committed = results.filter((r) => r.statusCode === 200);
+    const duplicates = results.filter(
+      (r) => r.statusCode === 409 && r.json().error.reason === 'DUPLICATE_REQUEST',
+    );
+    expect(committed).toHaveLength(1);
+    expect(duplicates).toHaveLength(1);
+    expect(committed[0]!.json().performance.requestId).toBe(sharedId);
+
+    // The duplicate message names the winning (owner) session, regardless
+    // of which session the loser targeted.
+    const winnerId = committed[0]!.json().performance.id;
+    expect(duplicates[0]!.json().error.message).toContain(winnerId);
+
+    // Exactly one session advanced: winner v3 with its cue, loser untouched.
+    const [snapA, snapB] = [
+      (await getPerformance(a.id)).json().performance,
+      (await getPerformance(b.id)).json().performance,
+    ];
+    expect(snapA.version + snapB.version).toBe(5);
+    const winnerSnap = snapA.id === winnerId ? snapA : snapB;
+    const loserSnap = snapA.id === winnerId ? snapB : snapA;
+    expect(winnerSnap.version).toBe(3);
+    expect(winnerSnap.cues).toEqual([winnerSnap.id === a.id ? 11 : 22]);
+    expect(loserSnap.version).toBe(2);
+    expect(loserSnap.cues).toEqual([]);
+  });
+
+  it('one id racing as transition on two pending sessions: one commit, one DUPLICATE_REQUEST, no double version growth', async () => {
+    const a = await createSession('跨场次推进-A', 'req-x2t-ca');
+    const b = await createSession('跨场次推进-B', 'req-x2t-cb');
+
+    const sharedId = 'req-x2t-shared-transition';
+    const barrier = new Barrier(2);
+    const [resA, resB] = await raceWithBarrier(
+      [a.id, b.id].map((performanceId) => ({
+        command: 'transition',
+        performanceId,
+        status: 'running',
+        expectedVersion: 1,
+        requestId: sharedId,
+      })),
+      barrier,
+    );
+
+    const results = [resA, resB];
+    expect(results.filter((r) => r.statusCode === 200)).toHaveLength(1);
+    const duplicates = results.filter(
+      (r) => r.statusCode === 409 && r.json().error.reason === 'DUPLICATE_REQUEST',
+    );
+    expect(duplicates).toHaveLength(1);
+
+    const winnerId = results.find((r) => r.statusCode === 200)!.json().performance.id;
+    expect(duplicates[0]!.json().error.message).toContain(winnerId);
+
+    const snapA = (await getPerformance(a.id)).json().performance;
+    const snapB = (await getPerformance(b.id)).json().performance;
+    const winnerSnap = snapA.id === winnerId ? snapA : snapB;
+    const loserSnap = snapA.id === winnerId ? snapB : snapA;
+    expect(winnerSnap).toMatchObject({ status: 'running', version: 2, requestId: sharedId });
+    expect(loserSnap).toMatchObject({ status: 'pending', version: 1, requestId: expect.any(String) });
+    expect(loserSnap.requestId).not.toBe(sharedId);
+  });
+
+  it('one id racing for create vs command on an existing session — create wins', async () => {
+    const existing = await createSession('既有场次', 'req-cmc-existing');
+
+    const sharedId = 'req-cmc-shared';
+    const barrier = new Barrier(2);
+    // Dispatch the create contender first so the create-chain slot is
+    // entered before the session-chain contender; arbitration still
+    // happens under the synchronisation barrier.
+    const [createRes, cmdRes] = await Promise.all([
+      (async () => {
+        const promise = sendCommand({ command: 'create', name: '新建场次', requestId: sharedId });
+        await barrier.hit();
+        return promise;
+      })(),
+      (async () => {
+        const promise = sendCommand({
+          command: 'transition',
+          performanceId: existing.id,
+          status: 'running',
+          expectedVersion: 1,
+          requestId: sharedId,
+        });
+        await barrier.hit();
+        return promise;
+      })(),
+    ]);
+
+    expect(createRes.statusCode).toBe(200);
+    expect(createRes.json().performance).toMatchObject({
+      status: 'pending',
+      version: 1,
+      requestId: sharedId,
+    });
+    expect(cmdRes.statusCode).toBe(409);
+    expectRejected(cmdRes.json(), 'DUPLICATE_REQUEST');
+    // The owner named in the rejection is the freshly created session.
+    expect(cmdRes.json().error.message).toContain(createRes.json().performance.id);
+
+    // The existing session must be untouched by the losing command.
+    const snap = (await getPerformance(existing.id)).json().performance;
+    expect(snap).toMatchObject({ status: 'pending', version: 1 });
+    expect(snap.requestId).not.toBe(sharedId);
+  });
+
+  it('one id racing for create vs command on an existing session — command wins', async () => {
+    const existing = await createSession('既有场次-先到', 'req-cmm-existing');
+
+    const sharedId = 'req-cmm-shared';
+    const barrier = new Barrier(2);
+    // Command contender enters its session chain first; the create follows.
+    const [cmdRes, createRes] = await Promise.all([
+      (async () => {
+        const promise = sendCommand({
+          command: 'transition',
+          performanceId: existing.id,
+          status: 'running',
+          expectedVersion: 1,
+          requestId: sharedId,
+        });
+        await barrier.hit();
+        return promise;
+      })(),
+      (async () => {
+        const promise = sendCommand({
+          command: 'create',
+          name: '不该建成的场次',
+          requestId: sharedId,
+        });
+        await barrier.hit();
+        return promise;
+      })(),
+    ]);
+
+    expect(cmdRes.statusCode).toBe(200);
+    expect(cmdRes.json().performance).toMatchObject({
+      id: existing.id,
+      status: 'running',
+      version: 2,
+      requestId: sharedId,
+    });
+    expect(createRes.statusCode).toBe(409);
+    expectRejected(createRes.json(), 'DUPLICATE_REQUEST');
+    // The owner named is the existing session the command committed to.
+    expect(createRes.json().error.message).toContain(existing.id);
+
+    // The losing create must not have produced a session.
+    const reloaded = (await getPerformance(existing.id)).json().performance;
+    expect(reloaded).toMatchObject({ status: 'running', version: 2 });
+  });
+
+  it('replaying a committed id at another session reports the first owner, not the target', async () => {
+    const a = await createSession('首次归属-A', 'req-rp-ca');
+    const b = await createSession('重放目标-B', 'req-rp-cb');
+
+    const sharedId = 'req-rp-shared';
+    const committed = await sendCommand({
+      command: 'transition',
+      performanceId: a.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: sharedId,
+    });
+    expect(committed.statusCode).toBe(200);
+
+    // Replay against the other existing session.
+    const replayOther = await sendCommand({
+      command: 'transition',
+      performanceId: b.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: sharedId,
+    });
+    expect(replayOther.statusCode).toBe(409);
+    expectRejected(replayOther.json(), 'DUPLICATE_REQUEST');
+    expect(replayOther.json().error.message).toContain(a.id);
+    expect(replayOther.json().error.message).not.toContain(b.id);
+
+    // Replay against a non-existent session yields the same duplicate
+    // verdict (not SESSION_NOT_FOUND), still pointing at the first owner.
+    const replayMissing = await sendCommand({
+      command: 'transition',
+      performanceId: 'missing-session-id',
+      status: 'running',
+      expectedVersion: 1,
+      requestId: sharedId,
+    });
+    expect(replayMissing.statusCode).toBe(409);
+    expectRejected(replayMissing.json(), 'DUPLICATE_REQUEST');
+    expect(replayMissing.json().error.message).toContain(a.id);
+
+    // Replay as a create gives the identical conclusion and owner.
+    const replayCreate = await sendCommand({
+      command: 'create',
+      name: '重放创建',
+      requestId: sharedId,
+    });
+    expect(replayCreate.statusCode).toBe(409);
+    expectRejected(replayCreate.json(), 'DUPLICATE_REQUEST');
+    expect(replayCreate.json().error.message).toContain(a.id);
+
+    // Repeated replays stay stable: state and version never move again.
+    const [snapA, snapB] = [
+      (await getPerformance(a.id)).json().performance,
+      (await getPerformance(b.id)).json().performance,
+    ];
+    expect(snapA).toMatchObject({ status: 'running', version: 2, requestId: sharedId });
+    expect(snapB).toMatchObject({ status: 'pending', version: 1 });
+    expect(snapB.requestId).not.toBe(sharedId);
+  });
+
+  it('a contender rejected for its own precondition does not burn the shared id for the other session', async () => {
+    // When a contender's request slot is reached while its precondition is
+    // stale, it rejects with VERSION_CONFLICT and records nothing; the
+    // other session can then commit the same id. Enforced deterministically
+    // by sending the stale contender on its own (it acquires and releases
+    // the id slot before the contender on B is dispatched).
+    const a = await createSession('败方-A', 'req-lu-ca');
+    const b = await createSession('败方-B', 'req-lu-cb');
+    await sendCommand({
+      command: 'transition',
+      performanceId: a.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-lu-start-a',
+    });
+    await sendCommand({
+      command: 'transition',
+      performanceId: b.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-lu-start-b',
+    });
+
+    const sharedId = 'req-lu-shared';
+    const staleOnA = await sendCommand({
+      command: 'registerCue',
+      performanceId: a.id,
+      cue: 1,
+      expectedVersion: 1, // current version is 2 -> VERSION_CONFLICT
+      requestId: sharedId,
+    });
+    expect(staleOnA.statusCode).toBe(409);
+    expectRejected(staleOnA.json(), 'VERSION_CONFLICT');
+
+    // The rejected id is still usable: the other session commits it.
+    const okOnB = await sendCommand({
+      command: 'registerCue',
+      performanceId: b.id,
+      cue: 2,
+      expectedVersion: 2,
+      requestId: sharedId,
+    });
+    expect(okOnB.statusCode).toBe(200);
+    expect(okOnB.json().performance).toMatchObject({
+      id: b.id,
+      version: 3,
+      cues: [2],
+      requestId: sharedId,
+    });
+
+    // A later retry of the same id on A is now a true duplicate, and A
+    // stayed untouched throughout.
+    const retryOnA = await sendCommand({
+      command: 'registerCue',
+      performanceId: a.id,
+      cue: 1,
+      expectedVersion: 2,
+      requestId: sharedId,
+    });
+    expect(retryOnA.statusCode).toBe(409);
+    expectRejected(retryOnA.json(), 'DUPLICATE_REQUEST');
+    expect(retryOnA.json().error.message).toContain(b.id);
+    const snapA = (await getPerformance(a.id)).json().performance;
+    expect(snapA.cues).toEqual([]);
+    expect(snapA.version).toBe(2);
+  });
+
+  it('different request ids on two sessions still advance in parallel without interference', async () => {
+    const a = await createSession('并行-A', 'req-pa-ca');
+    const b = await createSession('并行-B', 'req-pa-cb');
+    const barrier = new Barrier(2);
+    const [resA, resB] = await raceWithBarrier(
+      [
+        {
+          command: 'transition',
+          performanceId: a.id,
+          status: 'running',
+          expectedVersion: 1,
+          requestId: 'req-pa-start-a',
+        },
+        {
+          command: 'transition',
+          performanceId: b.id,
+          status: 'running',
+          expectedVersion: 1,
+          requestId: 'req-pa-start-b',
+        },
+      ],
+      barrier,
+    );
+    expect(resA.statusCode).toBe(200);
+    expect(resB.statusCode).toBe(200);
+    for (const id of [a.id, b.id]) {
+      const snap = (await getPerformance(id)).json().performance;
+      expect(snap).toMatchObject({ status: 'running', version: 2 });
+    }
+  });
+});
+
 describe('performance console — envelope validation', () => {
   it('malformed JSON -> 400 INVALID_JSON', async () => {
     const res = await app.inject({

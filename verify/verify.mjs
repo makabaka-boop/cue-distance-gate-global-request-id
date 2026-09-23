@@ -8,7 +8,11 @@
  *   4. the web page and its /api proxy integration,
  *   5. the performance session console lifecycle through the web proxy,
  *      including refresh reload and the sealed read-only timeline,
- *   6. the host-published WEB_PORT override reaches the same stack.
+ *   6. global cross-session requestId deduplication: barrier-interleaved
+ *      "two sessions", "create vs modify" and "retarget after commit"
+ *      groups, checking success counts, the first-owner attribution,
+ *      per-session snapshots and the duplicate error verdict,
+ *   7. the host-published WEB_PORT override reaches the same stack.
  *
  * Exits 0 when every check passes, 1 otherwise.
  */
@@ -612,7 +616,348 @@ let perfId;
   );
 }
 
-console.log('\n[6] published WEB_PORT override');
+// ------------------------------------------------- global request dedup
+//
+// A requestId is a global idempotency key for the whole service life: the
+// same id may commit exactly once, no matter which session (or a create)
+// it targets. Each racing group is released from a cyclic barrier so the
+// contenders genuinely overlap inside the server's adjudication.
+
+class CyclicBarrier {
+  constructor(size) {
+    this.size = size;
+    this.waiting = 0;
+    this.arrived = [];
+  }
+
+  hit() {
+    const mine = new Promise((resolve) => this.arrived.push(resolve));
+    this.waiting += 1;
+    if (this.waiting === this.size) {
+      const all = this.arrived.splice(0);
+      // One macrotask later: every request has entered its adjudication
+      // chain before any contender is allowed to settle.
+      setTimeout(() => all.forEach((release) => release()), 10);
+    }
+    return mine;
+  }
+}
+
+async function raceBarriered(base, payloads, barrier) {
+  return Promise.all(
+    payloads.map(async (payload) => {
+      const promise = sendCommand(base, payload);
+      await barrier.hit();
+      return promise;
+    }),
+  );
+}
+
+async function createPerformance(base, name, requestId) {
+  const res = await sendCommand(base, { command: 'create', name, requestId });
+  if (res.status !== 200) {
+    throw new Error(`setup create failed: ${res.status} ${JSON.stringify(res.body)}`);
+  }
+  return res.body.performance;
+}
+
+function expectDuplicate(name, res, ownerId) {
+  const ok =
+    res.status === 409 &&
+    res.body?.error?.code === 'COMMAND_REJECTED' &&
+    res.body?.error?.reason === 'DUPLICATE_REQUEST' &&
+    res.body?.error?.message?.includes(ownerId);
+  check(
+    name,
+    ok,
+    `got ${res.status} ${JSON.stringify(res.body)} (expected DUPLICATE_REQUEST owned by ${ownerId})`,
+  );
+}
+
+async function expectSnapshot(name, base, id, expected) {
+  const res = await getPerformance(base, id);
+  const p = res.body?.performance;
+  const ok =
+    res.status === 200 &&
+    Object.entries(expected).every(([k, v]) =>
+      Array.isArray(v) ? JSON.stringify(p?.[k]) === JSON.stringify(v) : p?.[k] === v,
+    );
+  check(name, ok, `got ${res.status} ${JSON.stringify(res.body)}`);
+}
+
+console.log('\n[6] global cross-session requestId deduplication');
+
+// Unique run suffix: the server keeps the global id map in memory, so the
+// suite must not reuse fixed ids across repeated runs against one server.
+const gdRun = `gd-${Date.now()}-${commandSeq}`;
+
+// Group A: "two sessions" — the same id drives a cue/transition on two
+// distinct sessions simultaneously. Exactly one may commit.
+{
+  const s1 = await createPerformance(API_URL, '跨场次-A', `gd-a-create-${gdRun}`);
+  const s2 = await createPerformance(API_URL, '跨场次-B', `gd-b-create-${gdRun}`);
+  for (const [s, label] of [[s1, 'a'], [s2, 'b']]) {
+    const start = await sendCommand(API_URL, {
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: `gd-${label}-start-${gdRun}`,
+    });
+    check(`group A: ${label} running v2`, start.status === 200, JSON.stringify(start.body));
+  }
+
+  const shared = `gd-two-sessions-cue-${gdRun}`;
+  const [r1, r2] = await raceBarriered(
+    API_URL,
+    [
+      {
+        command: 'registerCue',
+        performanceId: s1.id,
+        cue: 101,
+        expectedVersion: 2,
+        requestId: shared,
+      },
+      {
+        command: 'registerCue',
+        performanceId: s2.id,
+        cue: 202,
+        expectedVersion: 2,
+        requestId: shared,
+      },
+    ],
+    new CyclicBarrier(2),
+  );
+
+  const committed = [r1, r2].filter((r) => r.status === 200);
+  const losers = [r1, r2].filter((r) => r.status !== 200);
+  check(
+    'group A: exactly one of two same-id cues commits',
+    committed.length === 1 && losers.length === 1,
+    `statuses=${[r1.status, r2.status].join(',')}`,
+  );
+
+  const winner = committed[0]?.body?.performance;
+  check(
+    'group A: loser is DUPLICATE_REQUEST naming the winner',
+    losers[0]?.status === 409 &&
+      losers[0]?.body?.error?.reason === 'DUPLICATE_REQUEST' &&
+      losers[0]?.body?.error?.message?.includes(winner?.id),
+    `got ${JSON.stringify(losers[0]?.body)}`,
+  );
+
+  const winnerCue = winner.id === s1.id ? 101 : 202;
+  await expectSnapshot('group A: winner advanced once (v3, own cue)', API_URL, winner.id, {
+    status: 'running',
+    version: 3,
+    requestId: shared,
+    cues: [winnerCue],
+  });
+  const loserId = winner.id === s1.id ? s2.id : s1.id;
+  await expectSnapshot('group A: loser untouched (v2, no cues)', API_URL, loserId, {
+    status: 'running',
+    version: 2,
+    cues: [],
+  });
+}
+
+// Group B: "create vs modify" — one id used at the same time to create a
+// new session and to modify an existing one. Both arrival orders are
+// exercised; exactly one side may ever succeed.
+for (const [order, firstLabel] of [
+  ['create-first', 'create'],
+  ['command-first', 'command'],
+]) {
+  const existing = await createPerformance(
+    API_URL,
+    `创建与修改-${order}`,
+    `gd-cm-${order}-existing-${gdRun}`,
+  );
+  const shared = `gd-cm-${order}-id-${gdRun}`;
+  const barrier = new CyclicBarrier(2);
+
+  const createPayload = { command: 'create', name: `新建-${order}`, requestId: shared };
+  const commandPayload = {
+    command: 'transition',
+    performanceId: existing.id,
+    status: 'running',
+    expectedVersion: 1,
+    requestId: shared,
+  };
+
+  // Encode arrival order by which contender's promise is constructed
+  // first; the barrier keeps the adjudication genuinely concurrent.
+  const contenders =
+    firstLabel === 'create' ? [createPayload, commandPayload] : [commandPayload, createPayload];
+  const [first, second] = await Promise.all([
+    (async () => {
+      const p = sendCommand(API_URL, contenders[0]);
+      await barrier.hit();
+      return p;
+    })(),
+    (async () => {
+      const p = sendCommand(API_URL, contenders[1]);
+      await barrier.hit();
+      return p;
+    })(),
+  ]);
+
+  const results = [first, second];
+  const ok = results.filter((r) => r.status === 200);
+  const rejected = results.filter((r) => r.status !== 200);
+  check(
+    `group B (${order}): exactly one of create/modify commits`,
+    ok.length === 1 && rejected.length === 1,
+    `statuses=${results.map((r) => r.status).join(',')}`,
+  );
+
+  const ownerId = ok[0]?.body?.performance?.id;
+  expectDuplicate(`group B (${order}): loser duplicate names first owner`, rejected[0], ownerId);
+
+  if (firstLabel === 'create') {
+    check(
+      `group B (${order}): create is the committed side`,
+      first.status === 200 &&
+        first.body?.performance?.status === 'pending' &&
+        first.body?.performance?.version === 1 &&
+        first.body?.performance?.requestId === shared,
+      `got ${first.status} ${JSON.stringify(first.body)}`,
+    );
+    await expectSnapshot(`group B (${order}): existing session untouched`, API_URL, existing.id, {
+      status: 'pending',
+      version: 1,
+      cues: [],
+    });
+  } else {
+    check(
+      `group B (${order}): modify is the committed side`,
+      first.status === 200 &&
+        first.body?.performance?.id === existing.id &&
+        first.body?.performance?.status === 'running' &&
+        first.body?.performance?.version === 2 &&
+        first.body?.performance?.requestId === shared,
+      `got ${first.status} ${JSON.stringify(first.body)}`,
+    );
+    // The losing create must not have materialised any session: its id is
+    // only known from a successful response, which did not happen. The
+    // existing session is instead exactly at the committed snapshot.
+    await expectSnapshot(`group B (${order}): existing session advanced once`, API_URL, existing.id, {
+      status: 'running',
+      version: 2,
+      requestId: shared,
+      cues: [],
+    });
+  }
+}
+
+// Group C: "replay after commit, retargeted" — once an id has committed
+// to session A, replaying it at session B, at a missing session and as a
+// create all return the identical duplicate verdict anchored at A.
+{
+  const a = await createPerformance(API_URL, '首次归属-A', `gd-rp-a-create-${gdRun}`);
+  const b = await createPerformance(API_URL, '换目标-B', `gd-rp-b-create-${gdRun}`);
+  const shared = `gd-retarget-id-${gdRun}`;
+
+  const committed = await sendCommand(API_URL, {
+    command: 'transition',
+    performanceId: a.id,
+    status: 'running',
+    expectedVersion: 1,
+    requestId: shared,
+  });
+  check(
+    'group C: first commit succeeds on A v2',
+    committed.status === 200 && committed.body?.performance?.id === a.id,
+    `got ${committed.status} ${JSON.stringify(committed.body)}`,
+  );
+
+  // Concurrent retarget: the barrier overlaps the replay against B with a
+  // replay against a non-existent session; both conclusions must agree.
+  const barrier = new CyclicBarrier(2);
+  const [replayB, replayMissing] = await Promise.all([
+    (async () => {
+      const p = sendCommand(API_URL, {
+        command: 'transition',
+        performanceId: b.id,
+        status: 'running',
+        expectedVersion: 1,
+        requestId: shared,
+      });
+      await barrier.hit();
+      return p;
+    })(),
+    (async () => {
+      const p = sendCommand(API_URL, {
+        command: 'transition',
+        performanceId: 'no-such-session-xyz',
+        status: 'running',
+        expectedVersion: 1,
+        requestId: shared,
+      });
+      await barrier.hit();
+      return p;
+    })(),
+  ]);
+
+  expectDuplicate('group C: replay at session B duplicates, anchored at A', replayB, a.id);
+  check(
+    'group C: replay at B does not name B',
+    !replayB.body?.error?.message?.includes(b.id),
+    JSON.stringify(replayB.body),
+  );
+  expectDuplicate(
+    'group C: replay at missing session duplicates (not SESSION_NOT_FOUND), anchored at A',
+    replayMissing,
+    a.id,
+  );
+
+  const replayCreate = await sendCommand(API_URL, {
+    command: 'create',
+    name: '重放创建',
+    requestId: shared,
+  });
+  expectDuplicate('group C: replay as create duplicates, anchored at A', replayCreate, a.id);
+
+  // Stable replay once more, then snapshots: A committed exactly once and
+  // B was never modified by the foreign id.
+  const replayAgain = await sendCommand(API_URL, {
+    command: 'registerCue',
+    performanceId: b.id,
+    cue: 9,
+    expectedVersion: 1,
+    requestId: shared,
+  });
+  expectDuplicate('group C: repeated replay stays anchored at A', replayAgain, a.id);
+
+  await expectSnapshot('group C: A stays at its first committed boundary', API_URL, a.id, {
+    status: 'running',
+    version: 2,
+    requestId: shared,
+    cues: [],
+  });
+  await expectSnapshot('group C: B untouched by all foreign replays', API_URL, b.id, {
+    status: 'pending',
+    version: 1,
+    cues: [],
+  });
+
+  // Sanity boundary: a *fresh* id at a missing session still reports
+  // SESSION_NOT_FOUND — the duplicate-first rule only applies to spent ids.
+  const freshMissing = await sendCommand(API_URL, {
+    command: 'transition',
+    performanceId: 'no-such-session-xyz',
+    status: 'running',
+    expectedVersion: 1,
+    requestId: commandRequestId('fresh-missing'),
+  });
+  check(
+    'group C: fresh id at missing session still SESSION_NOT_FOUND',
+    freshMissing.status === 404 && freshMissing.body?.error?.code === 'SESSION_NOT_FOUND',
+    `got ${freshMissing.status} ${JSON.stringify(freshMissing.body)}`,
+  );
+}
+
+console.log('\n[7] published WEB_PORT override');
 {
   const webPort = process.env.WEB_PORT ?? '8080';
   // In compose the published host port is reached via host-gateway; a local
